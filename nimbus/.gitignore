@@ -29,3 +29,6 @@ coverage.html
 *.tfstate.*
 .terraform/
 .terraform.lock.hcl
+
+# docs
+docs/

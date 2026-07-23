@@ -8,6 +8,9 @@
 This document is the canonical system-design reference. It is written as an **onboarding and
 design guide** — every major decision includes the *why* and the *tradeoff*, not just the *what*.
 
+> Want the **code-level** mechanics instead of the diagrams — how each subsystem actually works, line
+> by line, explained from first principles? See the [Engineering Internals guide](INTERNALS.md).
+
 ---
 
 ## Table of Contents
@@ -40,8 +43,8 @@ thousands of independent tenants."**
 | Concern | How Nimbus handles it |
 |---|---|
 | **Durability** | Every request is written to Postgres *before* we acknowledge the client (transactional outbox). The DB is the single source of truth. |
-| **At-least-once delivery** | A worker claims pending rows and retries with exponential backoff until success or max attempts. |
-| **No duplicate sends across replicas** | Rows are claimed with `FOR UPDATE SKIP LOCKED` — each worker gets a disjoint batch. |
+| **At-least-once delivery** | Two paths deliver pending rows: an event-driven SQS consumer (hot path) and a DB-poll worker (backstop). Both retry with exponential backoff until success or max attempts. |
+| **No duplicate sends across replicas or paths** | Every row is claimed with `FOR UPDATE SKIP LOCKED` before sending — the batch poller claims disjoint batches, the SQS consumer claims one row by id. Whichever path wins the atomic claim sends; the loser skips. |
 | **Idempotent writes** | Redis-backed idempotency keys collapse client retries into a single notification. |
 | **Fair multi-tenancy** | Sliding-window rate limiting per tenant; every query is tenant-scoped. |
 | **Downstream resilience** | Each channel sender is wrapped in a circuit breaker that fails fast when a provider is down. |
@@ -106,7 +109,8 @@ graph TB
     subgraph Gateway["Nimbus Gateway (single Go binary)"]
         http["HTTP Server :8080<br/>Chi router + middleware"]
         grpc["gRPC Server :9090<br/>unary + streaming"]
-        worker["Background Worker<br/>(goroutine, 5s poll)"]
+        consumer["SQS Consumer<br/>(hot path, N receivers)"]
+        worker["DB-poll Worker<br/>(goroutine, 30s backstop)"]
         breakers["Circuit Breakers<br/>per channel"]
     end
 
@@ -127,11 +131,14 @@ graph TB
 
     http -->|"idempotency,<br/>rate limit"| redis
     http -->|"INSERT pending<br/>(source of truth)"| pg
-    http -.->|"best-effort enqueue"| sqs
+    http -->|"enqueue"| sqs
 
     grpc --> pg
 
-    worker -->|"CLAIM ... SKIP LOCKED"| pg
+    sqs -->|"receive batch"| consumer
+    consumer -->|"CLAIM by id"| pg
+    worker -->|"CLAIM batch ... SKIP LOCKED"| pg
+    consumer --> breakers
     worker --> breakers
     breakers --> ses
     breakers --> sns
@@ -140,9 +147,11 @@ graph TB
     http -->|/metrics| client
 ```
 
-**Key insight (transactional outbox):** the HTTP handler writes the durable Postgres row first,
-then tries SQS as a *best-effort* fast path. If SQS is down we still return `201` — the worker's
-DB poll guarantees delivery. **SQS is an optimization, not a dependency.**
+**Key insight (transactional outbox + hybrid delivery):** the HTTP handler writes the durable
+Postgres row first, then enqueues to SQS. The **SQS consumer** picks it up in milliseconds (hot path),
+while the **DB-poll worker** runs as a slower reconciliation backstop. Both claim the row atomically
+in Postgres before sending, so they never double-send. If SQS is down we still return `201` and the
+poller delivers it — **SQS accelerates delivery but is never a hard dependency.**
 
 ---
 
@@ -160,14 +169,14 @@ graph TD
     end
 
     subgraph Core
-        worker["internal/worker<br/>poll loop + senders"]
+        worker["internal/worker<br/>poll loop + SQS consumer + senders"]
         cb["internal/circuitbreaker<br/>FSM + protected sender"]
     end
 
     subgraph Data
         db["internal/db<br/>repository + models"]
         rds["internal/redis<br/>idempotency + ratelimit"]
-        sqs["internal/sqs<br/>producer/consumer"]
+        sqs["internal/sqs<br/>producer/consumer transport"]
     end
 
     subgraph Intelligence
@@ -184,7 +193,7 @@ graph TD
     main --> api & igrpc & worker & ai & rag & cfg & obs & met
     api --> db & rds & sqs
     igrpc --> db
-    worker --> db & cb
+    worker --> db & cb & sqs
     cb --> worker
     ai --> db
     rag --> db & ai
@@ -296,12 +305,14 @@ sequenceDiagram
     end
 
     H->>R: Store(idempotency result)
-    H-)Q: Enqueue (best-effort, non-blocking)
+    H-)Q: Enqueue (non-blocking)
     H-->>C: 201 Created {id}
 
-    Note over W,DB: ...asynchronously...
-    W->>DB: ClaimPendingNotifications (SKIP LOCKED)
+    Note over W,DB: ...asynchronously (two paths, one claim guard)...
+    Q-)W: SQS consumer receives (hot path)
+    W->>DB: ClaimNotificationByID (atomic)
     W->>W: deliver via channel sender
+    Note over W,DB: DB-poll worker (backstop) claims anything SQS missed
 ```
 
 **Three key properties of this flow:**
@@ -310,36 +321,54 @@ sequenceDiagram
    acknowledgement is a promise we can keep even if everything downstream crashes.
 2. **Idempotency release on failure:** if the DB write fails *after* we reserved the key, we
    `Release()` it so the client's retry isn't poisoned with a false `409` for 5 minutes.
-3. **Best-effort enqueue:** the `-)` (async) arrow to SQS never blocks the response and never fails
-   the request.
+3. **Non-blocking enqueue:** the `-)` (async) arrow to SQS never blocks the response and never fails
+   the request. The SQS consumer delivers on the hot path; if the enqueue or SQS itself is down, the
+   DB-poll backstop still delivers the durable row.
 
 ---
 
-## 7. The Background Worker
+## 7. Delivery: the hybrid worker
 
-The worker is a simple, robust poll loop. Its correctness rests entirely on the atomic claim.
+Delivery runs on **two paths that share one atomic claim guard**, so they can run concurrently
+without ever double-sending:
+
+| Path | Trigger | Claim | Role |
+|---|---|---|---|
+| **SQS consumer** | message received (long-poll) | `ClaimNotificationByID` (one row) | Hot path — sub-second dispatch |
+| **DB-poll worker** | ticker (30s when SQS is on, else 5s) | `ClaimPendingNotifications` (batch, SKIP LOCKED) | Reconciliation backstop — delayed retries + anything SQS dropped |
+
+Both paths hand the claimed row to the **same `Dispatcher`**, so send / retry / dead-letter behavior
+is identical regardless of how the row was claimed.
 
 ```mermaid
 flowchart TD
-    start(["Tick every 5s"]) --> claim["ClaimPendingNotifications(limit)"]
-    claim --> q{"rows returned?"}
-    q -->|no| start
-    q -->|yes| loop["for each notification"]
+    subgraph Hot["SQS consumer (hot path)"]
+        recv(["receive batch (≤10)"]) --> claim1["ClaimNotificationByID"]
+        claim1 --> won{"claim won?"}
+        won -->|no| ack1["ack (delete msg)"]
+        won -->|yes| disp1["Dispatcher.Dispatch"]
+        disp1 --> ack1
+    end
 
-    loop --> send["sender.Send via circuit breaker"]
+    subgraph Backstop["DB-poll worker (backstop)"]
+        tick(["Tick every 30s"]) --> claim2["ClaimPendingNotifications(limit)"]
+        claim2 --> loop["for each notification"]
+        loop --> disp2["Dispatcher.Dispatch"]
+    end
+
+    disp1 --> send["sender.Send via circuit breaker"]
+    disp2 --> send
     send --> ok{"success?"}
-
     ok -->|yes| sent["status = sent"]
     ok -->|no| retryq{"attempt &lt; maxRetries (5)?"}
-
     retryq -->|yes| backoff["status = pending<br/>next_retry_at = now + backoff<br/>(1m → 5m → 15m)"]
     retryq -->|no| dlq["MoveToDeadLetter (txn):<br/>1. INSERT dlq row<br/>2. status = dead_lettered"]
-
-    sent --> loop
-    backoff --> loop
-    dlq --> loop
-    loop --> start
 ```
+
+> **Why the poller stays as a backstop:** an SQS message is one-shot. After the first attempt the
+> consumer always acks it. If the send failed but has retries left, `Dispatch` schedules the row back
+> to `pending` with a future `next_retry_at` — and the DB poller picks it up when due. The poller also
+> catches any message SQS ever drops. Fast path for the common case, durable path for correctness.
 
 ### The atomic claim — the heart of horizontal scalability
 
@@ -366,9 +395,9 @@ RETURNING ...;
   same row can never be sent twice by two replicas.
 
 **Design note:** This is a database-as-queue pattern. Exactly-once-ish claiming comes for free
-from Postgres' row locking, which removes an entire class of distributed-locking bugs. The tradeoff
-is polling latency (up to 5s) — acceptable for notifications, and the SQS fast path covers the
-latency-sensitive case.
+from Postgres' row locking, which removes an entire class of distributed-locking bugs. The same
+claim guard, scoped to a single id (`ClaimNotificationByID`), is what lets the SQS consumer run as a
+parallel hot path without risking a double-send against the poller.
 
 ---
 
@@ -379,7 +408,7 @@ Every notification walks this graph. Terminal states are `sent`, `dead_lettered`
 ```mermaid
 stateDiagram-v2
     [*] --> pending: API/gRPC create
-    pending --> processing: worker claims (SKIP LOCKED)
+    pending --> processing: claimed (SQS consumer or poll, atomic)
     processing --> sent: delivery ok
     processing --> pending: delivery failed, attempt < 5 (backoff)
     processing --> dead_lettered: delivery failed, attempt = 5
@@ -554,7 +583,7 @@ graph TB
             alb
         end
         subgraph Private["Private Subnets"]
-            ecs1["ECS Fargate Task 1<br/>gateway + worker"]
+            ecs1["ECS Fargate Task 1<br/>gateway + SQS consumer + worker"]
             ecs2["ECS Fargate Task N"]
         end
         subgraph DataTier["Data Tier"]
@@ -589,14 +618,15 @@ graph TB
 | Dimension | Current | How it scales |
 |---|---|---|
 | **API throughput** | 1 task | Stateless → add ECS tasks behind the ALB. |
-| **Worker throughput** | in-process goroutine | Split into its own deployment; `SKIP LOCKED` means N workers need **zero** coordination. |
+| **Delivery throughput** | in-process SQS consumer (N receivers × batch-of-10) + poll worker | Raise `Receivers`/`Concurrency`, or split delivery into its own deployment; `SKIP LOCKED` + per-id claim mean N nodes need **zero** coordination. |
 | **Write durability** | single RDS | Multi-AZ failover; read replicas for list endpoints. |
 | **Rate-limit / idempotency** | single Redis | Cluster mode; keys are already namespaced by tenant. |
 | **Vector search** | HNSW in Postgres | Good to ~tens of millions of vectors before a dedicated ANN store is warranted. |
 
-**Back-of-envelope:** at **100K notifications/day ≈ 1.16/sec average**. The SQS enqueue path is
-~500 ns of CPU per message and the DB claim batches 10 rows per 5s tick per worker — so a *single*
-worker already has ~80× headroom, and the design scales horizontally well past that.
+**Back-of-envelope:** at **10M notifications/day ≈ 116/sec average** (higher in bursts). The SQS
+consumer defaults — 3 receivers pulling batches of 10, up to 10 concurrent sends each — absorb that
+with large headroom, and the DB-poll backstop (30s tick, 10 rows/batch) mops up delayed retries. Both
+levers scale horizontally well past 10M/day.
 
 ---
 
@@ -604,13 +634,14 @@ worker already has ~80× headroom, and the design scales horizontally well past 
 
 | Failure | Blast radius | Mitigation |
 |---|---|---|
-| SQS unavailable | none | Best-effort enqueue; DB-poll path still delivers. |
+| SQS unavailable | none (slower) | Enqueue is non-blocking; the DB-poll backstop still delivers every row. |
 | Redis unavailable | degraded | Idempotency + rate limiting disabled, requests still served (logged warn). |
 | A provider (e.g. SES) down | that channel only | Circuit breaker opens → fail fast → retries/DLQ; other channels unaffected. |
-| Worker crash mid-send | one batch | Row stuck in `processing` is reclaimed after 5 min by another worker. |
+| Worker/consumer crash mid-send | one batch/message | Row stuck in `processing` is reclaimed after 5 min; unacked SQS messages reappear after the visibility timeout. |
+| SQS redelivers an already-sent message | none | `ClaimNotificationByID` returns "not claimable"; the consumer just acks — no re-send. |
 | Poison message (always fails) | one notification | Moves to DLQ after 5 attempts; never blocks the queue. |
 | Duplicate client retry | none | Idempotency key collapses it to one notification. |
-| Two workers, same row | none | `FOR UPDATE SKIP LOCKED` guarantees disjoint claims. |
+| Two workers/paths, same row | none | Atomic claim (`FOR UPDATE SKIP LOCKED` / claim-by-id) guarantees a single winner. |
 | Prompt injection (AI) | none | Regex guard + pinned system prompt (defense in depth). |
 | PII leak to OpenAI | none | Masked before any external API call. |
 
@@ -622,8 +653,9 @@ worker already has ~80× headroom, and the design scales horizontally well past 
 
 | Decision | Why | Tradeoff we accepted |
 |---|---|---|
-| **Transactional outbox** (DB first, SQS best-effort) | Durability without a distributed transaction across DB + queue | Up to 5s extra latency on the slow path (covered by the SQS fast path) |
-| **DB-as-queue with `SKIP LOCKED`** | Exactly-once claiming, horizontal scaling, no extra infra | Polling latency; not suited to millions of msgs/sec (we're far below that) |
+| **Transactional outbox** (DB first, then enqueue) | Durability without a distributed transaction across DB + queue | Delivery is eventually-consistent, not inline |
+| **Hybrid delivery** (SQS consumer hot path + DB-poll backstop, one claim guard) | Sub-second dispatch *and* guaranteed delivery even if SQS drops or is down | Two delivery paths to reason about (kept safe by the shared atomic claim) |
+| **DB-as-queue with `SKIP LOCKED`** | Exactly-once claiming, horizontal scaling, no extra infra | Backstop polling latency; not suited to millions of msgs/sec (we're far below that) |
 | **Two ports: REST :8080 + gRPC :9090** | Clean protocol separation; no h2c multiplexing complexity | Two listeners to operate |
 | **Per-channel circuit breakers** | Isolate provider failures | More breaker state to monitor |
 | **Idempotency in Redis, not DB unique constraint** | Sub-ms checks, TTL-based expiry, no schema bloat | Redis becomes a soft dependency (gracefully degraded) |
@@ -640,8 +672,8 @@ The core principles that drive the system's design:
 
 - **The database is the source of truth and the queue.** Outbox pattern + `FOR UPDATE SKIP LOCKED`
   gives durability and lock-free horizontal scaling in one move.
-- **SQS is an optimization, not a dependency.** If it's down, the DB poll still delivers; a write is
-  never failed because a queue hiccupped.
+- **SQS accelerates delivery but is never a hard dependency.** The consumer is the hot path; if it's
+  down, the DB poll backstop still delivers, and a write is never failed because a queue hiccupped.
 - **Idempotency is two-tier.** Auto content-hash keys (5 min) for accidental retries, explicit
   client keys (24 h) for strong dedup — the same model Stripe uses.
 - **Sliding window, not fixed window.** Redis sorted sets eliminate the boundary-burst problem.

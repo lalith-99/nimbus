@@ -226,8 +226,17 @@ func run() error {
 		}
 	}
 
+	// Poll interval for the DB worker. When SQS is configured the worker becomes a
+	// slow RECONCILIATION BACKSTOP (SQS is the fast hot path), so we poll less
+	// aggressively to reduce DB load. Without SQS it stays the primary delivery
+	// path and polls frequently.
+	pollInterval := 5 * time.Second
+	if cfg.SQSQueueURL != "" {
+		pollInterval = 30 * time.Second
+	}
+
 	w := worker.New(repo, multiSender, worker.Config{
-		PollInterval: 5 * time.Second,
+		PollInterval: pollInterval,
 		BatchSize:    10,
 		MaxRetries:   5,
 	}, logger)
@@ -237,7 +246,43 @@ func run() error {
 
 	go w.Start(workerCtx)
 
-	logger.Info("background worker started")
+	logger.Info("background worker started",
+		zap.Duration("poll_interval", pollInterval),
+		zap.Bool("sqs_hot_path", cfg.SQSQueueURL != ""),
+	)
+
+	// ── SQS Consumer (event-driven hot path) ─────────────────────────────────
+	// When a queue is configured, the SQS consumer is the PRIMARY, low-latency
+	// delivery path: it long-polls, atomically claims each notification in the DB
+	// (the same no-double-send guard the poller uses), and dispatches via the SAME
+	// Dispatcher. The DB poller above remains as a reconciliation backstop that
+	// catches delayed retries and anything SQS ever drops.
+	if cfg.SQSQueueURL != "" {
+		sqsConsumerTransport, cErr := sqs.NewConsumer(ctx, sqs.Config{
+			Region:   cfg.SQSRegion,
+			QueueURL: cfg.SQSQueueURL,
+			DLQURL:   cfg.SQSDLQURL,
+		}, logger)
+		if cErr != nil {
+			logger.Warn("sqs consumer unavailable; relying on DB-poll delivery",
+				zap.Error(cErr),
+			)
+		} else {
+			dispatcher := worker.NewDispatcher(repo, multiSender, 5, logger)
+			sqsConsumer := worker.NewSQSConsumer(
+				sqsConsumerTransport,
+				repo,
+				dispatcher,
+				worker.SQSConsumerConfig{
+					Receivers:   3,
+					Concurrency: 10,
+				},
+				logger,
+			)
+			go sqsConsumer.Start(workerCtx)
+			logger.Info("sqs consumer started (event-driven hot path)")
+		}
+	}
 
 	// ── gRPC Server ──────────────────────────────────────────────────────────
 	// We start gRPC on a separate port (9090) alongside HTTP (8080).

@@ -332,6 +332,68 @@ func (r *Repository) ClaimPendingNotifications(ctx context.Context, limit int) (
 	return notifications, rows.Err()
 }
 
+// ClaimNotificationByID atomically claims a SINGLE notification by id, marking it
+// 'processing'. This is the entry point for the SQS-driven hot path.
+//
+// WHY IT EXISTS (the no-double-send guarantee):
+// We run TWO delivery paths — the SQS consumer (fast, event-driven) and the DB
+// poller (slow reconciliation backstop). Both must never send the same row. The
+// claim is the single source of dedup truth: whichever path wins the atomic
+// UPDATE gets the row; the loser sees zero rows and skips. This is the same
+// `FOR UPDATE SKIP LOCKED` discipline as the batch claim, scoped to one id.
+//
+// It returns (nil, nil) — NOT an error — when the row is not claimable, i.e.:
+//   - already 'sent' / 'dead_lettered' (a duplicate SQS redelivery), or
+//   - already claimed by another worker/consumer ('processing', not yet stuck), or
+//   - a scheduled retry whose next_retry_at is still in the future.
+//
+// The caller (SQS consumer) treats (nil, nil) as "someone else owns this" and
+// simply deletes the SQS message. Delayed retries are intentionally left for the
+// poller backstop, since an SQS message is one-shot and can't be re-delivered at
+// next_retry_at.
+func (r *Repository) ClaimNotificationByID(ctx context.Context, id uuid.UUID) (*Notification, error) {
+	query := `
+		UPDATE notifications
+		SET status = 'processing', updated_at = NOW()
+		WHERE id = $1
+		  AND (
+		        (status = 'pending' AND (next_retry_at IS NULL OR next_retry_at <= NOW()))
+		     OR (status = 'processing' AND updated_at < NOW() - ($2 * INTERVAL '1 second'))
+		  )
+		RETURNING
+			id, tenant_id, user_id, channel, payload,
+			status, attempt, error_message, next_retry_at,
+			created_at, updated_at
+	`
+
+	reclaimSeconds := int(stuckProcessingTimeout.Seconds())
+
+	var notif Notification
+	err := r.db.Pool().QueryRow(ctx, query, id, reclaimSeconds).Scan(
+		&notif.ID,
+		&notif.TenantID,
+		&notif.UserID,
+		&notif.Channel,
+		&notif.Payload,
+		&notif.Status,
+		&notif.Attempt,
+		&notif.ErrorMessage,
+		&notif.NextRetryAt,
+		&notif.CreatedAt,
+		&notif.UpdatedAt,
+	)
+	if err == pgx.ErrNoRows {
+		// Not claimable — another path owns it, it's already terminal, or the
+		// retry isn't due yet. Not an error: the caller should skip and ack.
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("claim notification %s: %w", id, err)
+	}
+
+	return &notif, nil
+}
+
 // MoveToDeadLetter moves a failed notification to the dead letter queue
 func (r *Repository) MoveToDeadLetter(ctx context.Context, notif *Notification, lastError string) (*DeadLetterNotification, error) {
 	// Start a transaction

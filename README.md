@@ -28,8 +28,10 @@ delivered (or explicitly dead-lettered), across multiple channels, for thousands
 tenants — exactly once.**
 
 It is built around a **transactional outbox**: every request is written to PostgreSQL *before* the
-client is acknowledged, then a background worker claims and delivers it. The database is the single
-source of truth; the message queue is an optimization, never a dependency.
+client is acknowledged, then delivered asynchronously. Delivery runs on **two paths that share one
+atomic claim guard**: an **SQS consumer** (event-driven hot path, sub-second) and a **DB-poll worker**
+(reconciliation backstop). The database is the single source of truth; the queue accelerates delivery
+but is never a hard dependency — if SQS is down, the poller still delivers everything.
 
 ```mermaid
 graph LR
@@ -38,13 +40,16 @@ graph LR
 
     subgraph gw["Nimbus Gateway"]
         api["API + gRPC"] -->|INSERT pending| db
-        worker["Worker<br/>SKIP LOCKED"] -->|claim| db
-        worker --> cb["Circuit Breakers"]
+        consumer["SQS Consumer<br/>hot path"] -->|claim by id| db
+        worker["DB-poll Worker<br/>SKIP LOCKED backstop"] -->|claim batch| db
+        consumer --> cb["Circuit Breakers"]
+        worker --> cb
     end
 
     db[("PostgreSQL<br/>+ pgvector")]
     api -.->|idempotency<br/>rate limit| redis[("Redis")]
-    api -.->|best-effort| sqs[["SQS"]]
+    api -->|enqueue| sqs[["SQS"]]
+    sqs --> consumer
     cb --> ses["SES"] & sns["SNS"] & hook["Webhooks"]
 ```
 
@@ -59,6 +64,7 @@ graph LR
 |---|---|
 | **Dual transport** | REST/JSON (`:8080`) for external clients, gRPC/Protobuf (`:9090`) for internal services. |
 | **Durable, exactly-once-ish delivery** | Transactional outbox + `FOR UPDATE SKIP LOCKED` claiming → safe horizontal scaling with no distributed locks. |
+| **Hybrid delivery** | Event-driven **SQS consumer** (sub-second hot path) + **DB-poll worker** (reconciliation backstop). Both funnel through one atomic DB claim, so they never double-send. |
 | **Multi-channel** | Email (AWS SES), SMS (AWS SNS), Webhook (HTTP POST), routed by a multi-sender. |
 | **Retries & backoff** | Exponential-ish backoff (1m → 5m → 15m), max 5 attempts. |
 | **Dead Letter Queue** | Failed messages quarantined with inspect / retry / discard endpoints. |
@@ -149,7 +155,7 @@ All configuration is via environment variables (sensible defaults for local dev)
 | `REDIS_HOST` `REDIS_PORT` `REDIS_PASSWORD` `REDIS_DB` | localhost:6379 | Redis (optional — degrades gracefully). |
 | `AWS_REGION` `SES_FROM_EMAIL` | us-east-1 | Email via SES. |
 | `SNS_REGION` | us-east-1 | SMS via SNS. |
-| `SQS_QUEUE_URL` `SQS_DLQ_URL` `SQS_REGION` | — | SQS fast path (optional). |
+| `SQS_QUEUE_URL` `SQS_DLQ_URL` `SQS_REGION` | — | SQS hot path (optional — enables the event-driven consumer; DB poll backstop still runs). |
 | `OPENAI_API_KEY` `OPENAI_MODEL` | — / `gpt-4o-mini` | Enables AI compose + RAG. |
 | `GRPC_AUTH_TOKENS` | `dev-token-nimbus:...0001` | `token:tenant` pairs, comma-separated. |
 
@@ -236,6 +242,7 @@ nimbus/
 ## 📚 Documentation
 
 - **[Architecture Deep Dive](docs/ARCHITECTURE.md)** — C4 diagrams, sequence flows, state machines, scaling, failure modes, and design tradeoffs.
+- **[Engineering Internals](docs/INTERNALS.md)** — a code-level walkthrough of how every subsystem works (built from first principles), with the design tradeoffs spelled out.
 - **[API Reference](docs/API.md)** — every REST endpoint + the gRPC contract.
 - [AWS Setup](docs/AWS_SETUP.md) · [Multi-Channel](docs/MULTI_CHANNEL.md) · [Migrations](docs/migrations.md)
 - [AI Integration & RAGAS Eval](ai-integration/README.md)
